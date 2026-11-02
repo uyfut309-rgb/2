@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-canvas: #06090f;
+    --bg-surface: #0a0f18;
+    --bg-card: #0e1524;
+    --border-color: #172338;
+    --border-strong: #223554;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --text-muted: #64748b;
+    --accent-blue: #38bdf8;
+    --accent-emerald: #10b981;
+    --accent-amber: #f59e0b;
+    --accent-rose: #f43f5e;
+    --accent-purple: #c084fc;
+    color-scheme: dark;
+  }
+
+  body.sunlight-mode {
+    --bg-canvas: #f8fafc;
+    --bg-surface: #ffffff;
+    --bg-card: #f1f5f9;
+    --border-color: #0f172a;
+    --border-strong: #000000;
+    --text-primary: #000000;
+    --text-secondary: #0f172a;
+    --text-muted: #334155;
+    --accent-blue: #0284c7;
+    --accent-emerald: #047857;
+    --accent-amber: #b45309;
+    --accent-rose: #be123c;
+    --accent-purple: #7e22ce;
+    color-scheme: light;
+  }
+
+  html, body, #root {
+    height: 100%;
+    height: 100dvh;
+    width: 100%;
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    position: fixed;
+    inset: 0;
+    -webkit-user-select: none;
+    user-select: none;
+    touch-action: manipulation;
+  }
+
+  body {
+    background-color: var(--bg-canvas);
+    color: var(--text-primary);
+    font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  
+  code, kbd, samp, pre, .font-mono {
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Rugged Tactile Instrument Button Classes */
+.btn-tactile {
+  transition: all 0.12s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+.btn-tactile:active {
+  transform: translateY(1px);
+  box-shadow: 0 0 1px rgba(0, 0, 0, 0.5), inset 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+/* Subtle carbon grid texture in dark mode */
+.bg-carbon-texture {
+  background-image: radial-gradient(rgba(56, 189, 248, 0.04) 1px, transparent 0);
+  background-size: 16px 16px;
+}
+
+/* Custom compact scrollbars for internal sub-lists only */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 2px;
+}
