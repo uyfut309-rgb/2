@@ -18,6 +18,7 @@ import {
   Clock,
   Radio,
   Layers,
+  X,
 } from 'lucide-react';
 
 interface ContactTestSummary {
@@ -42,6 +43,7 @@ interface ContactTestViewProps {
   onRunContactTest: () => Promise<void>;
   onUpdateContactSummary?: (summary: ContactTestSummary) => void;
   onGoToSurvey?: () => void;
+  onOpenCableTest?: () => void;
   isLoadingContact: boolean;
   isSunlightMode: boolean;
 }
@@ -52,11 +54,14 @@ export const ContactTestView: React.FC<ContactTestViewProps> = ({
   onRunContactTest,
   onUpdateContactSummary,
   onGoToSurvey,
+  onOpenCableTest,
   isLoadingContact,
   isSunlightMode,
 }) => {
   const [selectedElectrodes, setSelectedElectrodes] = useState<number[]>([]);
   const [isRetesting, setIsRetesting] = useState(false);
+  const [isSkipping, setIsSkipping] = useState(false);
+  const [skippedList, setSkippedList] = useState<number[]>([]);
   const [isSavingCRS, setIsSavingCRS] = useState(false);
   const [crsSavedSuccess, setCrsSavedSuccess] = useState<string | null>(null);
 
@@ -136,6 +141,39 @@ export const ContactTestView: React.FC<ContactTestViewProps> = ({
       console.error(e);
     } finally {
       setIsRetesting(false);
+    }
+  };
+
+  // Skip / Bypass broken or flooded electrode by regenerating the .CMD script without it
+  const handleSkipElectrode = async (elNum: number) => {
+    setIsSkipping(true);
+    try {
+      const res = await fetch('/api/instrument/skip-electrode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ electrode: elNum }),
+      });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        setSkippedList(data.skippedElectrodes || []);
+        // Also remove from selected
+        setSelectedElectrodes((prev) => prev.filter((e) => e !== elNum));
+        // If we have contactSummary, update badElectrodes locally
+        if (contactSummary) {
+          const updatedBad = contactSummary.badElectrodes.filter((e) => e.electrode !== elNum);
+          const updatedSummary = {
+            ...contactSummary,
+            badElectrodes: updatedBad,
+            over5k: updatedBad.length,
+            criticalCount: updatedBad.length,
+          };
+          onUpdateContactSummary?.(updatedSummary);
+        }
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsSkipping(false);
     }
   };
 
@@ -292,19 +330,35 @@ export const ContactTestView: React.FC<ContactTestViewProps> = ({
             </button>
 
             {contactSummary && (
-              <button
-                onClick={handleSaveAndDownloadCRS}
-                disabled={isSavingCRS}
-                className={`flex items-center gap-1.5 px-3 py-2.5 rounded-lg text-xs font-bold border transition-all cursor-pointer ${
-                  isSunlightMode
-                    ? 'bg-slate-100 hover:bg-slate-200 border-black text-black'
-                    : 'bg-[#121f33] hover:bg-[#1a2c47] border-cyan-500/40 text-cyan-300'
-                }`}
-                title="Descargar archivo oficial de resistencias de contacto .CRS para archivo de campaña"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>{isSavingCRS ? 'Guardando...' : 'Descargar .CRS'}</span>
-              </button>
+              <>
+                {onOpenCableTest && (
+                  <button
+                    onClick={onOpenCableTest}
+                    className={`flex items-center gap-1.5 px-3 py-2.5 rounded-lg text-xs font-bold border transition-all cursor-pointer ${
+                      isSunlightMode
+                        ? 'bg-slate-100 hover:bg-slate-200 border-black text-black'
+                        : 'bg-[#121f33] hover:bg-[#1a2c47] border-blue-500/40 text-blue-300'
+                    }`}
+                    title="Diagnóstico de continuidad de hilos, fuga de aislamiento y detección de carretes cruzados"
+                  >
+                    <Layers className="w-3.5 h-3.5 text-blue-400" />
+                    <span>Test de Cableado</span>
+                  </button>
+                )}
+                <button
+                  onClick={handleSaveAndDownloadCRS}
+                  disabled={isSavingCRS}
+                  className={`flex items-center gap-1.5 px-3 py-2.5 rounded-lg text-xs font-bold border transition-all cursor-pointer ${
+                    isSunlightMode
+                      ? 'bg-slate-100 hover:bg-slate-200 border-black text-black'
+                      : 'bg-[#121f33] hover:bg-[#1a2c47] border-cyan-500/40 text-cyan-300'
+                  }`}
+                  title="Descargar archivo oficial de resistencias de contacto .CRS para archivo de campaña"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>{isSavingCRS ? 'Guardando...' : 'Descargar .CRS'}</span>
+                </button>
+              </>
             )}
           </div>
         </div>
@@ -653,14 +707,27 @@ export const ContactTestView: React.FC<ContactTestViewProps> = ({
                   </span>.
                 </div>
               </div>
-              <button
-                onClick={handleFixAllCritical}
-                disabled={isRetesting}
-                className="px-3.5 py-2 rounded-lg font-bold text-xs bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-400 hover:to-yellow-400 text-black border border-amber-300 shadow-md cursor-pointer flex items-center gap-1.5 shrink-0 self-end sm:self-center"
-              >
-                <Zap className="w-3.5 h-3.5 fill-current" />
-                <span>{isRetesting ? 'Humectando...' : '💧 Humectar y Desbloquear'}</span>
-              </button>
+              <div className="flex flex-wrap items-center gap-2 shrink-0 self-end sm:self-center">
+                {selectedElectrodes.length === 1 && (
+                  <button
+                    onClick={() => handleSkipElectrode(selectedElectrodes[0])}
+                    disabled={isSkipping}
+                    className="px-3 py-2 rounded-lg font-bold text-xs bg-rose-950/70 hover:bg-rose-900 text-rose-300 border border-rose-500/50 cursor-pointer flex items-center gap-1"
+                    title="Excluye esta pica rota o inaccesible y regenera automáticamente el script .CMD sin detener la cuadrilla"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    <span>{isSkipping ? 'Omitiendo...' : `Omitir Pica #${selectedElectrodes[0]} (.CMD)`}</span>
+                  </button>
+                )}
+                <button
+                  onClick={handleFixAllCritical}
+                  disabled={isRetesting}
+                  className="px-3.5 py-2 rounded-lg font-bold text-xs bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-400 hover:to-yellow-400 text-black border border-amber-300 shadow-md cursor-pointer flex items-center gap-1.5"
+                >
+                  <Zap className="w-3.5 h-3.5 fill-current" />
+                  <span>{isRetesting ? 'Humectando...' : '💧 Humectar y Desbloquear'}</span>
+                </button>
+              </div>
             </div>
           ) : (
             contactSummary && contactSummary.values.length > 0 && (
@@ -699,6 +766,63 @@ export const ContactTestView: React.FC<ContactTestViewProps> = ({
           )}
         </div>
       )}
+
+      {/* 2.5 AGI Contact Improvement Guide & Field Recipes */}
+      <div
+        className={`rounded-xl border p-4 sm:p-5 shadow-xl transition-colors ${
+          isSunlightMode ? 'bg-white border-black text-black' : 'bg-[#0b1320] border-[#1e2e46] text-white'
+        }`}
+      >
+        <div className="flex items-center justify-between mb-3 border-b border-slate-700/50 pb-2">
+          <div className="flex items-center gap-2">
+            <span className="text-amber-400 font-bold text-sm">💡</span>
+            <h3 className="text-xs sm:text-sm font-bold uppercase tracking-wider text-amber-300">
+              Asistente de Terreno AGI: Métodos de Reducción de Resistencia de Contacto
+            </h3>
+          </div>
+          <span className="text-[10px] font-mono opacity-70">
+            Objetivo AGI: Rc &lt; 1.8 kΩ (Tx 200W Pleno)
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5 text-[11px] font-mono">
+          <div className="p-3 rounded-xl border border-slate-800 bg-[#070e17] space-y-1">
+            <div className="font-bold text-cyan-300 flex items-center gap-1.5">
+              <span>💧 1. Salmuera (NaCl 5%)</span>
+            </div>
+            <p className="opacity-80 text-[10px] leading-relaxed">
+              1 kg de sal común por 20 L de agua. Humectar generosamente el bulbo de la pica. Disminuye la resistencia de contacto entre 60% y 85% en suelos secos y pedregosos.
+            </p>
+          </div>
+
+          <div className="p-3 rounded-xl border border-slate-800 bg-[#070e17] space-y-1">
+            <div className="font-bold text-emerald-300 flex items-center gap-1.5">
+              <span>🌱 2. Bentonita Sódica</span>
+            </div>
+            <p className="opacity-80 text-[10px] leading-relaxed">
+              Lodo de bentonita conductora para fracturas, gravas aluviales o roca dura. Sella el contacto y retiene humedad hasta 48 horas continuas.
+            </p>
+          </div>
+
+          <div className="p-3 rounded-xl border border-slate-800 bg-[#070e17] space-y-1">
+            <div className="font-bold text-purple-300 flex items-center gap-1.5">
+              <span>❄️ 3. Cloruro de Calcio (CaCl2)</span>
+            </div>
+            <p className="opacity-80 text-[10px] leading-relaxed">
+              Higroscópico y anticongelante. Ideal para alta cordillera (&gt;3,800 msnm) o permafrost, absorbiendo humedad del aire y evitando congelamiento del lazo.
+            </p>
+          </div>
+
+          <div className="p-3 rounded-xl border border-slate-800 bg-[#070e17] space-y-1">
+            <div className="font-bold text-amber-300 flex items-center gap-1.5">
+              <span>🛡️ 4. Poza con Lámina Aluminio</span>
+            </div>
+            <p className="opacity-80 text-[10px] leading-relaxed">
+              En afloramientos de roca viva donde la pica no penetra, colocar una lámina de aluminio o malla de cobre cubierta con arena mojada y piedra de peso.
+            </p>
+          </div>
+        </div>
+      </div>
 
       {/* 3. Hardware Diagnostics: Receiver Test (AGI Test Box), IP Windows & SP Noise */}
       <div

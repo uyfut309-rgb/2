@@ -30,6 +30,9 @@ import {
   Zap,
   Shield,
   AlertTriangle,
+  AlertOctagon,
+  CloudLightning,
+  ShieldAlert,
 } from 'lucide-react';
 import { Pseudosection } from './components/Pseudosection';
 import { ContactTestView } from './components/ContactTestView';
@@ -41,6 +44,8 @@ import { RollAlongModal } from './components/RollAlongModal';
 import { FieldNotesModal, FieldNote } from './components/FieldNotesModal';
 import { ReportModal } from './components/ReportModal';
 import { SurveyFinalizedModal } from './components/SurveyFinalizedModal';
+import { PreFlightModal, PreFlightCheckData } from './components/PreFlightModal';
+import { CableVerificationModal } from './components/CableVerificationModal';
 import { QuadripolePoint, SequenceConfig } from './utils/ert-math';
 import { SuggestedDrillhole, loadAcceptedDrillholes } from './utils/petrophysics';
 import { beeper } from './utils/audio-beeper';
@@ -73,6 +78,17 @@ export default function App() {
   const [showConfirmStopModal, setShowConfirmStopModal] = useState(false);
   const [showRemeasureModal, setShowRemeasureModal] = useState(false);
   const [remeasureThreshold, setRemeasureThreshold] = useState(2.0);
+
+  // Advanced Hardware Control & Pre-Flight Gate States
+  const [isPreFlightOpen, setIsPreFlightOpen] = useState(false);
+  const [preFlightData, setPreFlightData] = useState<PreFlightCheckData | null>(null);
+  const [isCableModalOpen, setIsCableModalOpen] = useState(false);
+  const [isStormAlertActive, setIsStormAlertActive] = useState(false);
+  const [holdArmProgress, setHoldArmProgress] = useState(0);
+  const [isHoldingArm, setIsHoldingArm] = useState(false);
+  const holdArmIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const [countdownSeconds, setCountdownSeconds] = useState<number | null>(null);
+  const countdownIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Modals
   const [isRollAlongOpen, setIsRollAlongOpen] = useState(false);
@@ -376,15 +392,91 @@ export default function App() {
     )
   );
 
-  const requestStartSurvey = () => {
-    if (!isQcPassed) {
-      showToast(
-        '⚠️ Inyección bloqueada por seguridad: Se requiere verificación de contacto de electrodos (QC Picas < 5.0 kΩ) antes de armar el transmisor.',
-        'warning'
-      );
-      setActiveTab('contact');
+  const handleEmergencyStop = async () => {
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setCountdownSeconds(null);
+    cancelHoldArm();
+    setShowArmTxModal(false);
+
+    try {
+      await fetch('/api/instrument/emergency-stop', { method: 'POST' });
+    } catch (e) {
+      console.error(e);
+    }
+
+    setIsRunning(false);
+    setIsTxArmed(false);
+    beeper.playWarningBuzz();
+    showToast('🛑 PARADA DE EMERGENCIA: Transmisor desarmado inmediatamente a 0 V.', 'warning');
+    fetchState();
+  };
+
+  const handleToggleStormAlert = async () => {
+    if (!isStormAlertActive) {
+      try {
+        await fetch('/api/instrument/storm-alert', { method: 'POST' });
+      } catch (e) {
+        console.error(e);
+      }
+      setIsRunning(false);
+      setIsTxArmed(false);
+      setIsStormAlertActive(true);
+      beeper.playWarningBuzz();
+      showToast('⚡ ALERTA DE TORMENTA: Transmisor desconectado y picas a tierra de seguridad.', 'warning');
+    } else {
+      setIsStormAlertActive(false);
+      showToast('Alerta de tormenta desactivada. Línea reconectada.', 'info');
+    }
+  };
+
+  const handleSwapBatteries = async () => {
+    try {
+      const res = await fetch('/api/instrument/swap-batteries', { method: 'POST' });
+      const data = await res.json();
+      if (data.status === 'ok') {
+        setInstrument((prev) => ({
+          ...prev,
+          batteryInternal: data.batteryInternal,
+          batteryExternal: data.batteryExternal,
+        }));
+        showToast('✓ Baterías intercambiadas (Ppal ↔ Boost) para equilibrar descarga profunda (AGI).', 'success');
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const requestStartSurvey = async () => {
+    if (isStormAlertActive) {
+      showToast('⚠️ Inyección bloqueada: Alerta de tormenta eléctrica activa.', 'warning');
       return;
     }
+
+    try {
+      const res = await fetch('/api/instrument/preflight-check');
+      const data: PreFlightCheckData = await res.json();
+      setPreFlightData(data);
+
+      if (!data.allPassed) {
+        setIsPreFlightOpen(true);
+        beeper.playWarningBuzz();
+        return;
+      }
+    } catch (e) {
+      console.error(e);
+      if (!isQcPassed) {
+        showToast(
+          '⚠️ Inyección bloqueada por seguridad: Se requiere verificación de contacto de electrodos (QC Picas < 5.0 kΩ) antes de armar el transmisor.',
+          'warning'
+        );
+        setActiveTab('contact');
+        return;
+      }
+    }
+
     if (!isTxArmed) {
       setShowArmTxModal(true);
       return;
@@ -392,10 +484,78 @@ export default function App() {
     handleStartSurvey();
   };
 
+  const startHoldArm = () => {
+    if (isTxArmed) {
+      disarmTx();
+      return;
+    }
+    setIsHoldingArm(true);
+    setHoldArmProgress(0);
+    const start = Date.now();
+    const duration = 1800; // 1.8 seconds hold to prevent accidental arming
+
+    holdArmIntervalRef.current = setInterval(() => {
+      const elapsed = Date.now() - start;
+      const progress = Math.min(100, Math.round((elapsed / duration) * 100));
+      setHoldArmProgress(progress);
+
+      if (progress >= 100) {
+        if (holdArmIntervalRef.current) {
+          clearInterval(holdArmIntervalRef.current);
+          holdArmIntervalRef.current = null;
+        }
+        setIsHoldingArm(false);
+        setHoldArmProgress(0);
+        setShowArmTxModal(false);
+        startArmCountdown();
+      }
+    }, 40);
+  };
+
+  const cancelHoldArm = () => {
+    if (holdArmIntervalRef.current) {
+      clearInterval(holdArmIntervalRef.current);
+      holdArmIntervalRef.current = null;
+    }
+    setIsHoldingArm(false);
+    setHoldArmProgress(0);
+  };
+
+  const startArmCountdown = () => {
+    setCountdownSeconds(3);
+    beeper.playShotBeep();
+
+    let count = 3;
+    countdownIntervalRef.current = setInterval(() => {
+      count -= 1;
+      if (count > 0) {
+        setCountdownSeconds(count);
+        beeper.playShotBeep();
+      } else {
+        if (countdownIntervalRef.current) {
+          clearInterval(countdownIntervalRef.current);
+          countdownIntervalRef.current = null;
+        }
+        setCountdownSeconds(null);
+        setIsTxArmed(true);
+        beeper.playCompletionChirp();
+        handleStartSurvey();
+      }
+    }, 1000);
+  };
+
+  const cancelCountdown = () => {
+    if (countdownIntervalRef.current) {
+      clearInterval(countdownIntervalRef.current);
+      countdownIntervalRef.current = null;
+    }
+    setCountdownSeconds(null);
+    showToast('Armado de transmisor cancelado por el operador.', 'info');
+  };
+
   const handleArmAndStart = () => {
-    setIsTxArmed(true);
     setShowArmTxModal(false);
-    handleStartSurvey();
+    startArmCountdown();
   };
 
   const disarmTx = () => {
@@ -638,14 +798,19 @@ export default function App() {
 
         {/* Center Hardware Telemetry HUD (Tablet / Desktop view) */}
         <div className="hidden md:flex items-center gap-3.5 text-[9.5px] font-mono font-semibold opacity-95">
-          <div className="flex items-center gap-1.5" title="Batería principal interna (12.6V nominal, 12.1V bajo carga de inyección) y batería boost externa (12.4V nominal, 11.9V bajo carga)">
+          <button
+            onClick={handleSwapBatteries}
+            className="flex items-center gap-1.5 cursor-pointer hover:bg-slate-800/60 px-1.5 py-0.5 rounded transition-colors text-left"
+            title="Batería principal interna y boost externa. Clic para intercambiarlas (rotación AGI a mitad de jornada)."
+          >
             <BatteryMedium className="w-3.5 h-3.5 text-emerald-400" />
             <span>
               Bat. Ppal (Int): <strong className="text-emerald-400">{instrument.batteryInternal}V</strong> <span className="text-[8.5px] opacity-75">({(instrument.batteryInternal - 0.48).toFixed(1)}V carga)</span>
               <span className="opacity-40 mx-1">│</span>
-              Boost Tx (Ext): <strong className="text-cyan-400">{instrument.batteryExternal}V</strong> <span className="text-[8.5px] opacity-75">({(instrument.batteryExternal - 0.45).toFixed(1)}V carga)</span>
+              Boost Tx (Ext): <strong className="text-cyan-400">{instrument.batteryExternal}V</strong>
+              <span className="ml-1 text-[8.5px] text-amber-300 font-bold">⇄ Rotar</span>
             </span>
-          </div>
+          </button>
 
           <span className="opacity-30">│</span>
 
@@ -654,7 +819,7 @@ export default function App() {
             <span>
               TX: <strong>200W máx</strong> <span className="text-[8.5px] text-amber-300">({isRunning ? '178W real' : '0W standby'})</span>
               <span className="opacity-40 mx-1">·</span>
-              Disipador: <strong className="text-slate-200">{instrument.temperatureC}°C</strong>
+              Disipador: <strong className={instrument.temperatureC > 45 ? 'text-amber-400' : 'text-slate-200'}>{instrument.temperatureC}°C</strong>
             </span>
           </div>
 
@@ -666,8 +831,51 @@ export default function App() {
           </div>
         </div>
 
-        {/* Quick Instrument Utilities (Sunlight Mode, QC, Notes, Sound) */}
+        {/* Quick Instrument Utilities (E-STOP, Pre-Flight, Storm, Sunlight, Notes, Sound) */}
         <div className="flex items-center gap-1.5 text-[10px] font-mono">
+          {/* Persistent E-STOP Emergency Hard Cutoff Button */}
+          <button
+            onClick={handleEmergencyStop}
+            className="px-2 sm:px-2.5 py-1 rounded-md bg-gradient-to-r from-red-600 to-rose-700 hover:from-red-500 hover:to-rose-600 text-white font-black text-[10px] flex items-center gap-1 border border-red-400 shadow-md shadow-rose-950/60 cursor-pointer animate-pulse"
+            title="PARADA DE EMERGENCIA INMEDIATA: Desarma el transmisor (0V) y corta inyección en 0ms"
+          >
+            <AlertOctagon className="w-3.5 h-3.5 fill-current" />
+            <span className="tracking-tight">E-STOP</span>
+          </button>
+
+          {/* Storm Alert Button */}
+          <button
+            onClick={handleToggleStormAlert}
+            className={`px-1.5 sm:px-2 py-1 rounded border font-bold flex items-center gap-1 cursor-pointer transition-all ${
+              isStormAlertActive
+                ? 'bg-amber-400 text-black border-black ring-2 ring-black font-black animate-pulse'
+                : 'bg-[#18131d] border-purple-500/40 text-purple-300 hover:bg-[#251b2e]'
+            }`}
+            title="Alerta de Tormenta Eléctrica: Desconexión de seguridad para cuadrilla y equipo contra rayos"
+          >
+            <CloudLightning className="w-3.5 h-3.5 text-amber-400" />
+            <span className="hidden xl:inline">Tormenta</span>
+          </button>
+
+          {/* Pre-flight Checklist Button */}
+          <button
+            onClick={async () => {
+              try {
+                const res = await fetch('/api/instrument/preflight-check');
+                const data = await res.json();
+                setPreFlightData(data);
+              } catch (e) {
+                console.error(e);
+              }
+              setIsPreFlightOpen(true);
+            }}
+            className="px-1.5 sm:px-2 py-1 rounded border border-cyan-500/40 bg-[#0c1828] text-cyan-300 hover:bg-[#14243b] font-bold flex items-center gap-1 cursor-pointer"
+            title="Verificar los 5 puntos de la lista de pre-vuelo obligatoria AGI"
+          >
+            <ShieldCheck className="w-3.5 h-3.5 text-cyan-400" />
+            <span className="hidden xl:inline">Pre-Vuelo</span>
+          </button>
+
           {/* Sunlight Mode Toggle Button */}
           <button
             onClick={() => setIsSunlightMode(!isSunlightMode)}
@@ -722,6 +930,24 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* Lightning Storm Safety Banner */}
+      {isStormAlertActive && (
+        <div className="bg-amber-500 text-black px-4 py-2 text-xs font-bold font-mono flex items-center justify-between z-40 border-b border-black animate-pulse">
+          <div className="flex items-center gap-2">
+            <CloudLightning className="w-4 h-4 text-black shrink-0" />
+            <span>
+              ⚡ ALERTA DE TORMENTA ELÉCTRICA ACTIVA: Inyección de corriente desconectada por seguridad atmosférica. Picas y carretes aislados contra transitorios de rayo.
+            </span>
+          </div>
+          <button
+            onClick={handleToggleStormAlert}
+            className="px-2 py-0.5 rounded bg-black text-white hover:bg-slate-800 text-[10px] font-bold cursor-pointer shrink-0"
+          >
+            Reanudar Operación
+          </button>
+        </div>
+      )}
 
       {/* Floating High-Contrast Toast Notification */}
       {toast && (
@@ -897,8 +1123,13 @@ export default function App() {
                 ) : !isRunning ? (
                   <button
                     onClick={requestStartSurvey}
+                    onMouseDown={isTxArmed || !isQcPassed ? undefined : startHoldArm}
+                    onMouseUp={cancelHoldArm}
+                    onMouseLeave={cancelHoldArm}
+                    onTouchStart={isTxArmed || !isQcPassed ? undefined : startHoldArm}
+                    onTouchEnd={cancelHoldArm}
                     disabled={!instrument.connected}
-                    className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 sm:py-2.5 px-2.5 sm:px-4 rounded-lg sm:rounded-xl text-xs sm:text-sm font-extrabold min-h-[38px] sm:min-h-[42px] cursor-pointer btn-tactile border ${
+                    className={`flex-1 relative overflow-hidden flex items-center justify-center gap-1.5 py-1.5 sm:py-2.5 px-2.5 sm:px-4 rounded-lg sm:rounded-xl text-xs sm:text-sm font-extrabold min-h-[38px] sm:min-h-[42px] cursor-pointer btn-tactile border select-none ${
                       !instrument.connected
                         ? 'bg-slate-300 dark:bg-slate-800 text-slate-500 border-slate-400 cursor-not-allowed'
                         : !isQcPassed
@@ -914,9 +1145,17 @@ export default function App() {
                         ? 'Bloqueo de seguridad: Requiere QC de picas aprobado (< 5.0 kΩ) antes de disparar'
                         : isTxArmed
                         ? 'Iniciar disparos con transmisor armado (800 Vp-p)'
-                        : 'Armar transmisor de alto voltaje (800 Vp-p) e iniciar'
+                        : 'Mantén pulsado 1.8s o pulsa para verificar pre-vuelo y armar transmisor'
                     }
                   >
+                    {/* Hold-to-arm fill progress background */}
+                    {isHoldingArm && (
+                      <div
+                        style={{ width: `${holdArmProgress}%` }}
+                        className="absolute inset-0 bg-amber-500/50 transition-all pointer-events-none"
+                      />
+                    )}
+
                     {!isQcPassed ? (
                       <>
                         <AlertTriangle className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-400 shrink-0" />
@@ -927,10 +1166,15 @@ export default function App() {
                         <Play className="w-3.5 h-3.5 sm:w-4 sm:h-4 fill-current text-white shrink-0" />
                         <span className="truncate">INICIAR ADQUISICIÓN</span>
                       </>
+                    ) : isHoldingArm ? (
+                      <>
+                        <Zap className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-200 shrink-0 animate-pulse" />
+                        <span className="truncate font-black">SOLTAR CANCELA · {holdArmProgress}%</span>
+                      </>
                     ) : (
                       <>
                         <Zap className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-amber-300 shrink-0 animate-pulse" />
-                        <span className="truncate">ARMAR TX Y DISPARAR</span>
+                        <span className="truncate">MANTÉN PULSADO O CLIC PARA ARMAR TX</span>
                       </>
                     )}
                   </button>
@@ -987,6 +1231,16 @@ export default function App() {
                 >
                   <Square className="w-3 h-3 fill-current text-rose-400" />
                   <span className="hidden sm:inline">Fin</span>
+                </button>
+
+                {/* Always-visible Dock E-STOP Emergency Cutoff */}
+                <button
+                  onClick={handleEmergencyStop}
+                  className="px-2 sm:px-3 py-1.5 sm:py-2 rounded-lg sm:rounded-xl text-[10px] sm:text-xs font-black min-h-[38px] sm:min-h-[42px] border cursor-pointer btn-tactile bg-red-600 hover:bg-red-700 text-white border-red-300 shadow-lg flex items-center gap-1 shrink-0 animate-pulse"
+                  title="PARADA DE EMERGENCIA INMEDIATA (Corte de corriente en 0ms a 0V)"
+                >
+                  <AlertOctagon className="w-3.5 h-3.5 fill-current text-white shrink-0" />
+                  <span>E-STOP</span>
                 </button>
 
                 {/* Roll-Along Button */}
@@ -1068,6 +1322,7 @@ export default function App() {
                 onGoToSurvey={() => setActiveTab('survey')}
                 isLoadingContact={isLoadingContact}
                 isSunlightMode={isSunlightMode}
+                onOpenCableTest={() => setIsCableModalOpen(true)}
               />
             )}
             {activeTab === 'config' && (
@@ -1509,6 +1764,64 @@ export default function App() {
                 <span>Ejecutar Remedición</span>
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* 5-Points Pre-Flight Safety Interlock Modal */}
+      <PreFlightModal
+        isOpen={isPreFlightOpen}
+        onClose={() => setIsPreFlightOpen(false)}
+        data={preFlightData}
+        onArmAndStart={() => {
+          setIsPreFlightOpen(false);
+          startArmCountdown();
+        }}
+        onGoToContact={() => {
+          setIsPreFlightOpen(false);
+          setActiveTab('contact');
+        }}
+        onGoToConfig={() => {
+          setIsPreFlightOpen(false);
+          setActiveTab('config');
+        }}
+        onSwapBatteries={handleSwapBatteries}
+        isSunlightMode={isSunlightMode}
+      />
+
+      {/* Cable & Cross-Coupling Verification Modal */}
+      <CableVerificationModal
+        isOpen={isCableModalOpen}
+        onClose={() => setIsCableModalOpen(false)}
+        isSunlightMode={isSunlightMode}
+      />
+
+      {/* Fullscreen High-Voltage Siren Countdown Beacon Overlay */}
+      {countdownSeconds !== null && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/90 backdrop-blur-md animate-in fade-in">
+          <div className="w-full max-w-sm rounded-3xl border-2 border-amber-400 bg-[#0e1626] p-6 text-center text-white shadow-2xl flex flex-col items-center gap-4">
+            <div className="relative">
+              <div className="w-24 h-24 rounded-full border-4 border-amber-400 border-t-transparent animate-spin flex items-center justify-center" />
+              <div className="absolute inset-0 flex items-center justify-center font-black text-4xl text-amber-300 font-mono">
+                {countdownSeconds}
+              </div>
+            </div>
+            <div className="space-y-1">
+              <h3 className="text-lg font-black text-amber-400 flex items-center justify-center gap-2">
+                <Zap className="w-5 h-5 text-amber-400 animate-pulse" />
+                <span>ARMANDO TRANSMISOR</span>
+              </h3>
+              <p className="text-xs text-slate-300 font-mono">
+                Baliza sonora activa. Inyección de alto voltaje (800 Vp-p) en curso en {countdownSeconds}s. Cuadrilla fuera de línea.
+              </p>
+            </div>
+            <button
+              onClick={cancelCountdown}
+              className="w-full py-3 rounded-xl bg-red-600 hover:bg-red-700 text-white font-black text-sm tracking-wider cursor-pointer border border-red-400 shadow-lg flex items-center justify-center gap-2"
+            >
+              <AlertOctagon className="w-4 h-4 fill-current" />
+              <span>CANCELAR ARMAR (0V)</span>
+            </button>
           </div>
         </div>
       )}

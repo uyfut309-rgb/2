@@ -1,0 +1,25 @@
+{
+  "name": "ERT Manager · SuperSting R8/IP",
+  "short_name": "SuperSting R8",
+  "description": "Consola móvil de control y adquisición de hardware para tomografía eléctrica multicanal e IP AGI SuperSting R8.",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#070b10",
+  "theme_color": "#070b10",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    {
+      "src": "/survey_view.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/survey_view.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

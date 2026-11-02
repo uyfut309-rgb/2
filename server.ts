@@ -822,6 +822,245 @@ app.post('/api/instrument/sp-test', (req: Request, res: Response) => {
   });
 });
 
+let skippedElectrodes: number[] = [];
+
+app.post('/api/instrument/cable-test', (req: Request, res: Response) => {
+  const total = surveyConfig.electrodes || 56;
+  const reelsCount = Math.ceil(total / 14); // 14 takeouts per standard AGI cable reel
+  const reels = [];
+
+  for (let r = 0; r < reelsCount; r++) {
+    const startEl = r * 14 + 1;
+    const endEl = Math.min(total, (r + 1) * 14);
+    // Typical line cable wire resistance: ~0.8 to 1.4 Ohm per section; insulation > 100 MOhm
+    const wireContinuityOhm = Number((0.95 + Math.random() * 0.45).toFixed(2));
+    const insulationMohm = Math.round(180 + Math.random() * 120);
+    // Check for reversed reel (takeout polarity flip)
+    const isReversed = false;
+
+    reels.push({
+      reelIndex: r + 1,
+      electrodesRange: `${startEl} - ${endEl}`,
+      wireContinuityOhm,
+      insulationMohm,
+      polarityStatus: isReversed ? 'REVERSED_ERROR' : 'NORMAL_CORRECT',
+      continuityPass: wireContinuityOhm < 2.5,
+      insulationPass: insulationMohm > 50,
+      overallStatus: 'PASS',
+    });
+  }
+
+  // Cross-takeout verification test
+  const crossCouplingTests = [
+    { pairTx: '1-2', pairRx: '3-4', expectedVpMv: 42.5, measuredVpMv: 42.1, status: 'MATCH_OK' },
+    { pairTx: '15-16', pairRx: '17-18', expectedVpMv: 38.2, measuredVpMv: 38.4, status: 'MATCH_OK' },
+    { pairTx: '29-30', pairRx: '31-32', expectedVpMv: 41.0, measuredVpMv: 40.8, status: 'MATCH_OK' },
+  ];
+
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toLocaleTimeString(),
+    totalElectrodes: total,
+    reelsChecked: reels.length,
+    reels,
+    crossCouplingTests,
+    cableIntegrity: '100% OPERATIVO (Sin carretes cruzados ni fugas de aislamiento detectadas)',
+    leakageCurrentUa: 0.12,
+  });
+});
+
+app.post('/api/instrument/skip-electrode', (req: Request, res: Response) => {
+  const { electrode, action } = req.body;
+  const elNum = Number(electrode);
+
+  if (!elNum || elNum < 1 || elNum > surveyConfig.electrodes) {
+    return res.status(400).json({ error: 'Número de electrodo inválido.' });
+  }
+
+  if (action === 'restore') {
+    skippedElectrodes = skippedElectrodes.filter((e) => e !== elNum);
+  } else {
+    if (!skippedElectrodes.includes(elNum)) {
+      skippedElectrodes.push(elNum);
+    }
+  }
+
+  // Regenerate sequence filtering out quadripoles containing the skipped electrode
+  const fullSeq = generateSequence(surveyConfig);
+  const filteredSeq = fullSeq.filter(
+    (pt) => !pt.p.some((pEl) => skippedElectrodes.includes(pEl))
+  );
+
+  surveySession.points = filteredSeq;
+  if (surveySession.currentIndex > filteredSeq.length) {
+    surveySession.currentIndex = filteredSeq.length;
+  }
+
+  // Regenerate CMD script
+  const sanitizedProgId = (surveyConfig.progId || 'SURVEY').slice(0, 8).toUpperCase();
+  const newCmd = formatCMD(sanitizedProgId, filteredSeq);
+  const cmdFilename = `${sanitizedProgId}.CMD`;
+  storedFiles.set(cmdFilename, {
+    name: cmdFilename,
+    baseName: sanitizedProgId,
+    type: 'cmd',
+    formatsAvailable: ['cmd'],
+    pointsCount: filteredSeq.length,
+    createdAt: new Date().toISOString(),
+    sizeBytes: Buffer.byteLength(newCmd, 'utf8'),
+    content: newCmd,
+    metadata: {
+      ...defaultCmdMeta,
+      hashSha256: crypto.createHash('sha256').update(newCmd).digest('hex'),
+    },
+  });
+
+  broadcastSSE('sequence_updated', {
+    skippedElectrodes,
+    totalPoints: filteredSeq.length,
+    omittedQuadripolesCount: fullSeq.length - filteredSeq.length,
+  });
+
+  res.json({
+    status: 'ok',
+    skippedElectrodes,
+    totalPoints: filteredSeq.length,
+    omittedQuadripolesCount: fullSeq.length - filteredSeq.length,
+    message:
+      action === 'restore'
+        ? `Electrodo #${elNum} restaurado. Secuencia regenerada.`
+        : `Electrodo #${elNum} omitido por daño/fuga. Secuencia y .CMD regenerados sin el electrodo #${elNum} (${fullSeq.length - filteredSeq.length} cuadripolos omitidos).`,
+  });
+});
+
+app.post('/api/instrument/emergency-stop', (req: Request, res: Response) => {
+  surveySession.isRunning = false;
+  if (surveySession.timer) clearInterval(surveySession.timer);
+  surveySession.timer = null;
+  surveySession.activeElectrodes = { tx: [], rx: [] };
+
+  broadcastSSE('emergency_stop', {
+    timestamp: new Date().toISOString(),
+    voltageVp: 0,
+    currentMa: 0,
+    message: 'PARADA DE EMERGENCIA ACTIVADA: Transmisor desarmado inmediatamente a 0 V.',
+  });
+
+  res.json({
+    status: 'ok',
+    action: 'emergency_stop',
+    transmitterVoltageVp: 0,
+    isRunning: false,
+    message: 'PARADA DE EMERGENCIA ACTIVADA. Transmisor desarmado a 0 V.',
+  });
+});
+
+app.post('/api/instrument/storm-alert', (req: Request, res: Response) => {
+  surveySession.isRunning = false;
+  if (surveySession.timer) clearInterval(surveySession.timer);
+  surveySession.timer = null;
+  surveySession.activeElectrodes = { tx: [], rx: [] };
+
+  broadcastSSE('storm_alert', {
+    timestamp: new Date().toISOString(),
+    message: 'ALERTA DE TORMENTA ELÉCTRICA: Transmisor desconectado por seguridad atmosférica.',
+  });
+
+  res.json({
+    status: 'ok',
+    action: 'storm_safety_disconnect',
+    message: 'Línea desconectada y puesta a tierra segura contra rayos y transitorios atmosféricos.',
+  });
+});
+
+app.post('/api/instrument/swap-batteries', (req: Request, res: Response) => {
+  // AGI protocol: Swap internal main battery and external boost battery at midday
+  const prevInt = instrument.batteryInternal;
+  const prevExt = instrument.batteryExternal;
+  instrument.batteryInternal = prevExt;
+  instrument.batteryExternal = prevInt;
+
+  broadcastSSE('battery_swap', {
+    batteryInternal: instrument.batteryInternal,
+    batteryExternal: instrument.batteryExternal,
+  });
+
+  res.json({
+    status: 'ok',
+    message: 'Baterías intercambiadas (Ppal ↔ Boost) para equilibrar ciclos de descarga profunda según recomendación AGI.',
+    batteryInternal: instrument.batteryInternal,
+    batteryExternal: instrument.batteryExternal,
+  });
+});
+
+app.get('/api/instrument/preflight-check', (req: Request, res: Response) => {
+  const cr = instrument.contactResistance || [];
+  const badElectrodes = cr
+    .map((val, idx) => ({ electrode: idx + 1, resistanceKohm: val }))
+    .filter((e) => e.resistanceKohm > 5.0 && !skippedElectrodes.includes(e.electrode));
+
+  const contactPass = cr.length > 0 && badElectrodes.length === 0;
+  const batteryPass = instrument.batteryInternal >= 11.2 && instrument.batteryExternal >= 10.8;
+  const memoryPass = true; // 80k points capacity >> 668 points
+  const cmdPass = Boolean(surveyConfig.progId);
+  const gpsPass = instrument.gpsStatus.toLowerCase().includes('fix');
+
+  const allPassed = contactPass && batteryPass && memoryPass && cmdPass && gpsPass;
+
+  let blockReason = '';
+  if (!contactPass) {
+    blockReason =
+      cr.length === 0
+        ? 'Prueba de contacto no realizada. Ejecute QC de Picas antes de inyectar.'
+        : `Hay ${badElectrodes.length} electrodo(s) con resistencia > 5.0 kΩ. Huméctelos con agua salada u omítalos.`;
+  } else if (!batteryPass) {
+    blockReason = 'Batería baja (< 11.2 V). Recargue o intercambie con la batería boost.';
+  } else if (!cmdPass) {
+    blockReason = 'Archivo de comandos .CMD no generado o buffer no cargado.';
+  } else if (!gpsPass) {
+    blockReason = 'Sin señal GPS 3D Fix para georreferenciación de electrodos.';
+  }
+
+  res.json({
+    status: 'ok',
+    allPassed,
+    blockReason,
+    checks: {
+      contact: {
+        pass: contactPass,
+        title: 'Contacto de Electrodos (< 5.0 kΩ)',
+        detail:
+          cr.length === 0
+            ? 'Pendiente de prueba'
+            : badElectrodes.length === 0
+            ? `${cr.length} picas conformes`
+            : `${badElectrodes.length} picas críticas`,
+      },
+      battery: {
+        pass: batteryPass,
+        title: 'Batería bajo Carga (> 11.2 V)',
+        detail: `Int: ${instrument.batteryInternal}V · Ext: ${instrument.batteryExternal}V`,
+      },
+      memory: {
+        pass: memoryPass,
+        title: 'Memoria Flash R8 (> 5% libre)',
+        detail: 'Capacidad disponible: > 75,000 ptos (95%)',
+      },
+      cmd: {
+        pass: cmdPass,
+        title: 'Script .CMD Validado en Buffer',
+        detail: `Prog ID: ${surveyConfig.progId || 'SURVEY'} (${surveySession.points.length} cuadripolos)`,
+      },
+      gps: {
+        pass: gpsPass,
+        title: 'GNSS / Posicionamiento WGS84',
+        detail: `${instrument.gpsStatus} (${instrument.gpsSatellites} Satélites)`,
+      },
+    },
+    skippedElectrodes,
+  });
+});
+
 app.get('/api/survey/config', (req: Request, res: Response) => {
   res.json({ status: 'ok', config: surveyConfig });
 });
